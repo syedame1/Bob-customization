@@ -1,6 +1,6 @@
 # dockerfile-generator
 
-A Bob subagent that analyzes your project and generates production-ready Dockerfiles automatically.
+A Bob subagent (dockerfile-generator) that analyzes your project and generates production-ready Dockerfiles automatically.
 
 ---
 
