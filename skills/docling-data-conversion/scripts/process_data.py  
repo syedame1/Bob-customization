@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""
+process_data.py — Docling Data Conversion Script
+=================================================
+Covers all scenarios from SKILL.md:
+  convert       Single or batch file/URL → md, json, html, txt
+  tables        Extract all tables → CSV files
+  figures       Extract all embedded figures → PNG files
+  structure     Print document heading tree + summary counts
+  chunk         Hybrid RAG chunking (HuggingFace or OpenAI tokenizer)
+  vlm           VLM pipeline conversion (local HF or remote API)
+
+Usage examples
+--------------
+  python process_data.py convert report.pdf
+  python process_data.py convert report.pdf --to json --output ./out
+  python process_data.py convert file1.pdf file2.docx https://example.com/doc.pdf
+  python process_data.py convert report.pdf --no-ocr --no-tables
+  python process_data.py convert report.pdf --password SECRET
+  python process_data.py tables   report.pdf --output ./out/tables
+  python process_data.py figures  report.pdf --output ./out/figures
+  python process_data.py structure report.pdf
+  python process_data.py chunk    report.pdf --tokenizer hf --model sentence-transformers/all-MiniLM-L6-v2 --max-tokens 512
+  python process_data.py chunk    report.pdf --tokenizer openai --model text-embedding-3-small --max-tokens 8192
+  python process_data.py vlm      report.pdf --output ./out
+  python process_data.py vlm      report.pdf --remote-url http://localhost:8000/v1/chat/completions --remote-model ibm-granite/granite-docling-258M
+
+Install
+-------
+  pip install docling docling-core pandas
+  pip install 'docling-core[chunking-openai]'   # for --tokenizer openai
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _check_deps() -> None:
+    """Fail fast with a clear message if docling is not installed."""
+    for pkg in ("docling", "docling-core"):
+        try:
+            version(pkg)
+        except PackageNotFoundError:
+            sys.exit(
+                f"[ERROR] '{pkg}' is not installed.\n"
+                "Run: pip install docling docling-core"
+            )
+
+
+def _make_converter_standard(
+    do_ocr: bool = True,
+    do_tables: bool = True,
+) -> Any:
+    """Return a DocumentConverter configured for the standard (non-VLM) pipeline."""
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import EasyOcrOptions, PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    pipeline_options = PdfPipelineOptions(ocr_options=EasyOcrOptions())
+    pipeline_options.do_ocr = do_ocr
+    pipeline_options.do_table_structure = do_tables
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
+
+
+def _make_converter_vlm_local() -> Any:
+    """Return a DocumentConverter using the local GraniteDocling VLM (HuggingFace).
+
+    Requires: pip install docling[vlm]
+    """
+    try:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel import vlm_model_specs  # type: ignore[attr-defined]
+        from docling.datamodel.pipeline_options import VlmPipelineOptions  # type: ignore[attr-defined]
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.pipeline.vlm_pipeline import VlmPipeline  # type: ignore[import-untyped]
+    except ImportError as exc:
+        sys.exit(
+            f"[ERROR] VLM pipeline dependencies not available: {exc}\n"
+            "Run: pip install 'docling[vlm]'"
+        )
+
+    pipeline_options = VlmPipelineOptions(
+        vlm_options=vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
+        generate_page_images=True,
+    )
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_cls=VlmPipeline,
+                pipeline_options=pipeline_options,
+            )
+        }
+    )
+
+
+def _make_converter_vlm_remote(url: str, model: str, timeout: int = 120) -> Any:
+    """Return a DocumentConverter using a remote VLM API (vLLM / Ollama / LM Studio).
+
+    Requires: pip install 'docling[vlm]'
+    """
+    try:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import VlmPipelineOptions  # type: ignore[attr-defined]
+        from docling.datamodel.pipeline_options_vlm_model import (  # type: ignore[import-untyped]
+            ApiVlmOptions,
+            ResponseFormat,
+        )
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.pipeline.vlm_pipeline import VlmPipeline  # type: ignore[import-untyped]
+    except ImportError as exc:
+        sys.exit(
+            f"[ERROR] VLM pipeline dependencies not available: {exc}\n"
+            "Run: pip install 'docling[vlm]'"
+        )
+
+    vlm_opts = ApiVlmOptions(
+        url=url,
+        params=dict(model=model, max_tokens=4096),
+        prompt="Convert this page to docling.",
+        response_format=ResponseFormat.DOCTAGS,
+        timeout=timeout,
+    )
+    pipeline_options = VlmPipelineOptions(
+        vlm_options=vlm_opts,
+        generate_page_images=True,
+        enable_remote_services=True,
+    )
+    return DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_cls=VlmPipeline,
+                pipeline_options=pipeline_options,
+            )
+        }
+    )
+
+
+def _convert_one(converter: Any, source: str, password: str | None = None) -> Any:
+    """Convert a single source (path or URL) and return the result."""
+    from docling.datamodel.base_models import ConversionStatus
+
+    kwargs: dict[str, Any] = {}
+    if password:
+        try:
+            from docling.datamodel.settings import ConversionSettings  # type: ignore[import-untyped]
+            kwargs["settings"] = ConversionSettings(pdf_password=password)
+        except ImportError:
+            print("[WARN] ConversionSettings not available in this docling version; ignoring --password")
+
+    result = converter.convert(source, **kwargs)
+
+    if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
+        raise RuntimeError(f"Conversion failed for '{source}': {result.status}")
+    if result.status == ConversionStatus.PARTIAL_SUCCESS:
+        print(f"[WARN] Partial success for '{source}' — some pages may be missing.")
+    return result
+
+
+def _export_doc(doc: Any, fmt: str, out_path: Path) -> None:
+    """Export a DoclingDocument to the requested format and write to out_path."""
+    fmt = fmt.lower()
+    if fmt == "md":
+        out_path.write_text(doc.export_to_markdown(), encoding="utf-8")
+    elif fmt == "json":
+        out_path.write_text(
+            json.dumps(doc.export_to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    elif fmt == "html":
+        out_path.write_text(doc.export_to_html(), encoding="utf-8")
+    elif fmt == "txt":
+        out_path.write_text(doc.export_to_text(), encoding="utf-8")
+    else:
+        raise ValueError(f"Unknown output format: '{fmt}'. Choose md, json, html, or txt.")
+
+
+def _stem_from_source(source: str) -> str:
+    """Derive a safe filename stem from a path or URL."""
+    # Strip query string and fragment, trailing slash, then take last path segment stem
+    clean = source.split("?")[0].split("#")[0].rstrip("/")
+    stem = Path(clean).stem
+    # Replace characters unsafe in filenames
+    stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in stem)
+    return stem or "output"
+
+
+# ---------------------------------------------------------------------------
+# Sub-commands
+# ---------------------------------------------------------------------------
+
+def cmd_convert(args: argparse.Namespace) -> None:
+    """Convert one or more files/URLs to md, json, html, or txt."""
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    converter = _make_converter_standard(
+        do_ocr=not args.no_ocr,
+        do_tables=not args.no_tables,
+    )
+    ext_map = {"md": ".md", "json": ".json", "html": ".html", "txt": ".txt"}
+    ext = ext_map.get(args.to, ".md")
+
+    for source in args.sources:
+        print(f"\n→ Converting: {source}")
+        try:
+            result = _convert_one(converter, source, password=args.password)
+            doc = result.document
+            out_path = output_dir / f"{_stem_from_source(source)}{ext}"
+            _export_doc(doc, args.to, out_path)
+            print(f"  ✓ {len(doc.pages)} page(s), {len(doc.tables)} table(s), {len(doc.pictures)} figure(s)")
+            print(f"  ✓ Saved → {out_path}")
+        except Exception as exc:
+            print(f"  ✗ ERROR: {exc}")
+
+
+def cmd_tables(args: argparse.Namespace) -> None:
+    """Extract all tables from a document and save each as CSV + Markdown."""
+    try:
+        import pandas as _pd  # noqa: F401
+    except ImportError:
+        sys.exit("[ERROR] pandas is required for table export.\nRun: pip install pandas")
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    converter = _make_converter_standard()
+    source: str = args.source
+    print(f"→ Extracting tables from: {source}")
+    result = _convert_one(converter, source)
+    doc = result.document
+    stem = _stem_from_source(source)
+
+    if not doc.tables:
+        print("  No tables found in document.")
+        return
+
+    for i, table in enumerate(doc.tables):
+        df = table.export_to_dataframe()
+        csv_path = output_dir / f"{stem}_table_{i:03d}.csv"
+        df.to_csv(csv_path, index=False)
+
+        md_path = output_dir / f"{stem}_table_{i:03d}.md"
+        md_path.write_text(table.export_to_markdown(), encoding="utf-8")
+
+        print(f"  Table {i}: {df.shape[0]} row(s) × {df.shape[1]} col(s)  → {csv_path.name}  {md_path.name}")
+
+    print(f"\n  ✓ {len(doc.tables)} table(s) exported to {output_dir}")
+
+
+def cmd_figures(args: argparse.Namespace) -> None:
+    """Extract all embedded figures/pictures and save as PNG files."""
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    converter = _make_converter_standard()
+    source: str = args.source
+    print(f"→ Extracting figures from: {source}")
+    result = _convert_one(converter, source)
+    doc = result.document
+    stem = _stem_from_source(source)
+
+    if not doc.pictures:
+        print("  No figures found in document.")
+        return
+
+    saved = 0
+    for i, picture in enumerate(doc.pictures):
+        caption: str = picture.caption_text(doc) or "(no caption)"
+        print(f"  Figure {i}: {caption[:80]}")
+        if picture.image and picture.image.pil_image:
+            out_path = output_dir / f"{stem}_figure_{i:03d}.png"
+            picture.image.pil_image.save(out_path)
+            print(f"    → {out_path}")
+            saved += 1
+        else:
+            print("    → (no image data available)")
+
+    print(f"\n  ✓ {saved}/{len(doc.pictures)} figure(s) saved to {output_dir}")
+
+
+def cmd_structure(args: argparse.Namespace) -> None:
+    """Print document heading tree, summary counts, and optionally all text."""
+    converter = _make_converter_standard()
+    source: str = args.source
+    print(f"→ Analysing structure of: {source}")
+    result = _convert_one(converter, source)
+    doc = result.document
+
+    print("\n── Summary ─────────────────────────────")
+    print(f"  Pages:   {len(doc.pages)}")
+    print(f"  Tables:  {len(doc.tables)}")
+    print(f"  Figures: {len(doc.pictures)}")
+
+    # iterate_items() yields (NodeItem, int) tuples — item is first, level is second
+    print("\n── Heading Tree ─────────────────────────")
+    headings_found = False
+    for item, level in doc.iterate_items():  # type: ignore[misc]
+        label = getattr(item, "label", None)
+        text = getattr(item, "text", None)
+        if label is not None and getattr(label, "name", None) == "SECTION_HEADER" and text:
+            indent = "  " * max(0, level - 1)
+            marker = "#" * max(1, level)
+            print(f"{indent}{marker} {text}")
+            headings_found = True
+    if not headings_found:
+        print("  (no headings detected)")
+
+    if args.text:
+        print("\n── All Text Items ───────────────────────")
+        for item, _level in doc.iterate_items():  # type: ignore[misc]
+            text = getattr(item, "text", None)
+            if text:
+                print(text)
+
+
+def cmd_chunk(args: argparse.Namespace) -> None:
+    """Chunk a document for RAG using HybridChunker (HuggingFace or OpenAI tokenizer)."""
+    try:
+        from docling.chunking import HybridChunker  # type: ignore[import-untyped]
+    except ImportError:
+        sys.exit("[ERROR] HybridChunker not found.\nRun: pip install docling docling-core")
+
+    converter = _make_converter_standard()
+    source: str = args.source
+    print(f"→ Converting for chunking: {source}")
+    result = _convert_one(converter, source)
+    doc = result.document
+    print(f"  Pages: {len(doc.pages)}")
+    print(f"  Building tokenizer ({args.tokenizer}) …")
+
+    tokenizer: Any
+    if args.tokenizer == "hf":
+        try:
+            from docling_core.transforms.chunker.tokenizer.huggingface import (  # type: ignore[import-untyped]
+                HuggingFaceTokenizer,
+            )
+        except ImportError:
+            sys.exit("[ERROR] HuggingFaceTokenizer not available.\nRun: pip install docling-core")
+        tokenizer = HuggingFaceTokenizer.from_pretrained(
+            model_name=args.model,
+            max_tokens=args.max_tokens,
+        )
+    elif args.tokenizer == "openai":
+        try:
+            import tiktoken  # type: ignore[import-untyped]
+            from docling_core.transforms.chunker.tokenizer.openai import (  # type: ignore[import-untyped]
+                OpenAITokenizer,
+            )
+        except ImportError:
+            sys.exit(
+                "[ERROR] tiktoken or OpenAITokenizer not available.\n"
+                "Run: pip install tiktoken 'docling-core[chunking-openai]'"
+            )
+        tokenizer = OpenAITokenizer(
+            tokenizer=tiktoken.encoding_for_model(args.model),
+            max_tokens=args.max_tokens,
+        )
+    else:
+        sys.exit(f"[ERROR] Unknown tokenizer '{args.tokenizer}'. Choose 'hf' or 'openai'.")
+
+    chunker = HybridChunker(tokenizer=tokenizer, merge_peers=True)
+    chunks = list(chunker.chunk(doc))
+
+    if not chunks:
+        print("  No chunks produced.")
+        return
+
+    token_counts = [len(chunker.contextualize(c).split()) for c in chunks]
+    total = len(chunks)
+    print(f"\n── Chunk Summary ────────────────────────")
+    print(f"  Total chunks : {total}")
+    print(f"  Token counts : min={min(token_counts)}  max={max(token_counts)}  avg={sum(token_counts)/total:.0f}")
+
+    if args.output:
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = output_dir / f"{_stem_from_source(source)}_chunks.jsonl"
+        with out_path.open("w", encoding="utf-8") as fh:
+            for i, chunk in enumerate(chunks):
+                embed_text = chunker.contextualize(chunk)
+                page_no = None
+                try:
+                    page_no = chunk.meta.doc_items[0].prov[0].page_no
+                except (AttributeError, IndexError, TypeError):
+                    pass
+                record = {
+                    "index": i,
+                    "headings": getattr(getattr(chunk, "meta", None), "headings", []),
+                    "page": page_no,
+                    "text": embed_text,
+                }
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"\n  ✓ Chunks saved → {out_path}")
+    else:
+        print("\n── First 3 Chunks ───────────────────────")
+        for i, chunk in enumerate(chunks[:3]):
+            embed_text = chunker.contextualize(chunk)
+            headings = getattr(getattr(chunk, "meta", None), "headings", [])
+            print(f"\n  [Chunk {i}] headings={headings}")
+            print(f"  {embed_text[:300]}" + (" …" if len(embed_text) > 300 else ""))
+        print("\n  Tip: pass --output <dir> to save all chunks as .jsonl")
+
+
+def cmd_vlm(args: argparse.Namespace) -> None:
+    """Convert using the VLM pipeline (local GraniteDocling or remote API)."""
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.remote_url:
+        print(f"→ VLM pipeline (remote): {args.remote_url}")
+        converter = _make_converter_vlm_remote(
+            url=args.remote_url,
+            model=args.remote_model,
+            timeout=args.timeout,
+        )
+    else:
+        print("→ VLM pipeline (local GraniteDocling / HuggingFace)")
+        converter = _make_converter_vlm_local()
+
+    for source in args.sources:
+        print(f"\n  Converting: {source}")
+        try:
+            result = _convert_one(converter, source)
+            doc = result.document
+            out_path = output_dir / f"{_stem_from_source(source)}.md"
+            _export_doc(doc, "md", out_path)
+            print(f"  ✓ {len(doc.pages)} page(s), {len(doc.tables)} table(s), {len(doc.pictures)} figure(s)")
+            print(f"  ✓ Saved → {out_path}")
+        except Exception as exc:
+            print(f"  ✗ ERROR: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# CLI definition
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="process_data.py",
+        description="Docling document conversion — covers all SKILL.md scenarios.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── convert ──────────────────────────────────────────────────────────────
+    p_conv = sub.add_parser("convert", help="Convert file(s)/URL(s) to md/json/html/txt")
+    p_conv.add_argument("sources", nargs="+", metavar="SOURCE", help="Local file path(s) or URL(s)")
+    p_conv.add_argument("--to", default="md", choices=["md", "json", "html", "txt"],
+                        help="Output format (default: md)")
+    p_conv.add_argument("--output", default="./output", help="Output directory (default: ./output)")
+    p_conv.add_argument("--no-ocr", action="store_true", help="Disable OCR (born-digital PDFs only)")
+    p_conv.add_argument("--no-tables", action="store_true", help="Disable table structure detection (faster)")
+    p_conv.add_argument("--password", default=None, metavar="PASSWORD", help="PDF password for protected files")
+    p_conv.set_defaults(func=cmd_convert)
+
+    # ── tables ───────────────────────────────────────────────────────────────
+    p_tbl = sub.add_parser("tables", help="Extract all tables → CSV + Markdown files")
+    p_tbl.add_argument("source", metavar="SOURCE", help="Local file path or URL")
+    p_tbl.add_argument("--output", default="./output/tables", help="Output directory (default: ./output/tables)")
+    p_tbl.set_defaults(func=cmd_tables)
+
+    # ── figures ──────────────────────────────────────────────────────────────
+    p_fig = sub.add_parser("figures", help="Extract all embedded figures → PNG files")
+    p_fig.add_argument("source", metavar="SOURCE", help="Local file path or URL")
+    p_fig.add_argument("--output", default="./output/figures", help="Output directory (default: ./output/figures)")
+    p_fig.set_defaults(func=cmd_figures)
+
+    # ── structure ─────────────────────────────────────────────────────────────
+    p_str = sub.add_parser("structure", help="Print heading tree and document summary")
+    p_str.add_argument("source", metavar="SOURCE", help="Local file path or URL")
+    p_str.add_argument("--text", action="store_true", help="Also print all text items")
+    p_str.set_defaults(func=cmd_structure)
+
+    # ── chunk ─────────────────────────────────────────────────────────────────
+    p_chk = sub.add_parser("chunk", help="Hybrid RAG chunking (HybridChunker)")
+    p_chk.add_argument("source", metavar="SOURCE", help="Local file path or URL")
+    p_chk.add_argument("--tokenizer", default="hf", choices=["hf", "openai"],
+                       help="Tokenizer backend (default: hf)")
+    p_chk.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2",
+                       help="Model name for tokenizer")
+    p_chk.add_argument("--max-tokens", type=int, default=512, help="Max tokens per chunk (default: 512)")
+    p_chk.add_argument("--output", default=None, help="Output directory for .jsonl chunks (optional)")
+    p_chk.set_defaults(func=cmd_chunk)
+
+    # ── vlm ──────────────────────────────────────────────────────────────────
+    p_vlm = sub.add_parser("vlm", help="Convert using VLM pipeline (local or remote API)")
+    p_vlm.add_argument("sources", nargs="+", metavar="SOURCE", help="Local file path(s) or URL(s)")
+    p_vlm.add_argument("--output", default="./output", help="Output directory (default: ./output)")
+    p_vlm.add_argument("--remote-url", default=None, metavar="URL",
+                       help="Remote VLM API URL (e.g. http://localhost:8000/v1/chat/completions)")
+    p_vlm.add_argument("--remote-model", default="ibm-granite/granite-docling-258M",
+                       help="Model name for remote API (default: ibm-granite/granite-docling-258M)")
+    p_vlm.add_argument("--timeout", type=int, default=120,
+                       help="Request timeout in seconds for remote API (default: 120)")
+    p_vlm.set_defaults(func=cmd_vlm)
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    _check_deps()
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

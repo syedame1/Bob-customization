@@ -1,0 +1,11 @@
+rule_id,category,sub_condition,buyer_type,turnover_condition,outcome_type,rate,itc_eligible,reverse_charge,effective_from,effective_to,source_clause,confidence
+R001,renewable_energy_device,solar_water_heater_or_solar_power_system,any,none,rate,12,true,false,2024-07-01,,Entry 25,high
+R002,renewable_energy_device,solar_water_heater_or_solar_power_system,any,none,rate_superseded,5,true,false,,2024-06-30,Entry 25 (ref Notification 1/2017),high
+R003,educational_service,core_education_to_students_faculty_staff_up_to_higher_secondary,any,none,exemption,0,false,false,2024-07-01,,Entry 26,high
+R004,educational_service,entrance_exam_fee_separately_charged,any,none,rate,18,true,false,2024-07-01,,Entry 26,high
+R005,legal_service,advocate_or_law_firm_to_business_entity,business_entity,turnover_above_registration_threshold,reverse_charge,18,n/a,true,2024-07-01,,Entry 27,needs_review
+R006,legal_service,advocate_or_law_firm_to_business_entity,business_entity,turnover_below_registration_threshold,rate,18,true,false,2024-07-01,,Entry 27,high
+R007,restaurant_food_beverage,standard_restaurant_including_takeaway_room_service,any,none,rate,5,false,false,2024-07-01,,Entry 28,high
+R008,restaurant_food_beverage,located_in_hotel_with_room_tariff_above_7500,any,none,rate,18,true,false,2024-07-01,,Entry 28,high
+R009,gta_transport,goods_transport_by_road_recipient_registered,registered_person,none,reverse_charge,5,false,true,2024-07-01,,Entry 29,high
+R010,gta_transport,goods_transport_by_road_forward_charge_opted,any,none,rate,12,true,false,2024-07-01,,Entry 29,needs_review
