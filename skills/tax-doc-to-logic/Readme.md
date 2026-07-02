@@ -1,4 +1,4 @@
-# Tax-doc-to-logic
+# Tax-doc-to-logic (Tax Circulars to Implementable Logic)
 
 tax-doc-to-logic: Bob skill that converts indirect tax authority documents — rate notifications, circulars, exemption bulletins, and rulings — into structured decision tables and pseudocode that engineers can review and implement directly in tax calculation or determination engines.
 
