@@ -1,6 +1,6 @@
 # Tax-doc-to-logic (Tax Circulars to Implementable Logic)
 
-tax-doc-to-logic: Bob skill that converts indirect tax authority documents — rate notifications, circulars, exemption bulletins, and rulings — into structured decision tables and pseudocode that engineers can review and implement directly in tax calculation or determination engines.
+tax-doc-to-logic: Bob skill that converts tax authority documents — rate notifications, circulars, exemption bulletins, and rulings — into structured decision tables and pseudocode that engineers can review and implement directly in tax calculation or determination engines.
 
 Built for indirect tax domains: GST, VAT, Sales Tax, Customs Duty, and Excise across any jurisdiction.
 
